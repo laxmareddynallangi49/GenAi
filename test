@@ -1,1 +1,400 @@
-Hi 
+import streamlit as st
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+import os
+from datetime import datetime
+from fpdf import FPDF
+import httpx
+import pandas as pd
+import json
+import re
+import tempfile
+
+
+try:
+    import plotly.express as px
+    HAS_PLOTLY = True
+except Exception:
+    HAS_PLOTLY = False
+
+try:
+    import kaleido  # type: ignore
+    HAS_KALEIDO = True
+except Exception:
+    HAS_KALEIDO = False
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
+
+try:
+    from docx import Document
+    from docx.shared import Inches
+    HAS_DOCX = True
+except Exception:
+    HAS_DOCX = False
+
+# --------------------------
+# Setup
+# --------------------------
+# Token cache
+tiktoken_cache_dir = r"Y:\Hackathon\Hyderabad\Adibatla\Common\token"
+os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
+
+client = httpx.Client(verify=False)
+
+
+llm = ChatOpenAI(
+    base_url="https://genailab.tcs.in",
+    model="azure_ai/genailab-maas-DeepSeek-V3-0324",
+    api_key="sk-BaJV32uZLWWF9PhrzCkUig",
+    http_client=client
+)
+
+
+embedding_model = OpenAIEmbeddings(
+    base_url="https://genailab.tcs.in",
+    model="azure/genailab-maas-text-embedding-3-large",
+    api_key="sk-BaJV32uZLWWF9PhrzCkUig",
+    http_client=client
+)
+
+
+def generate_report(inputs):
+    prompt = f"""
+You are an expert ITSM documentation assistant.
+Generate a detailed, structured INCIDENT REPORT based on the user inputs.
+
+Follow this structure:
+1. Incident Summary
+2. Business Impact
+3. Technical Details
+4. Performance Metrics
+5. Root Cause (Preliminary / Confirmed)
+6. Recommended Preventive Measures
+7. Next Steps
+8. Incident Severity
+9. Prepared By & Timestamp
+
+After the narrative report, append EXACTLY TWO blocks with STRICT JSON enclosed in tags (no prose, no code fences, no extra text inside the tags):
+
+- <STATUS_PIE> ... </STATUS_PIE>
+  JSON object with key "data" whose value is an array of objects: each object has keys "label" (status value like Open/Closed/Resolved/etc) and "count" (integer number of tickets). Include up to 8 items.
+
+- <SEVERITY_BAR> ... </SEVERITY_BAR>
+  JSON object with key "data" whose value is an array of objects: each object has keys "label" (severity/priority like P1/P2/etc) and "count" (integer number of tickets). Include up to 8 items.
+
+Rules:
+- Use only numeric values (no % symbols or units) for counts.
+- Ensure the content inside each tag is valid JSON that can be parsed directly.
+
+User Inputs:
+{inputs}
+
+Write in clear, professional ITIL-style language.
+"""
+
+    response = llm.invoke([
+        {"role": "system", "content": "You write ITIL-style structured incident reports."},
+        {"role": "user", "content": prompt}
+    ])
+
+    return response.content
+
+
+def _strip_json_blocks(report_text: str) -> str:
+    cleaned = re.sub(r"<STATUS_PIE>.*?</STATUS_PIE>", "", report_text, flags=re.DOTALL)
+    cleaned = re.sub(r"<SEVERITY_BAR>.*?</SEVERITY_BAR>", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def _extract_tag_json(text: str, tag: str):
+    try:
+        m = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, flags=re.DOTALL)
+        if not m:
+            return None
+        raw = m.group(1).strip()
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def render_status_pie(status_json):
+    if not status_json or not status_json.get("data"):
+        return None
+    labels = [str(it.get("label", "")) for it in status_json["data"]]
+    counts = [float(it.get("count", 0)) for it in status_json["data"]]
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    path = tmp.name
+    tmp.close()
+
+    
+    if HAS_MPL:
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.pie(counts, labels=labels, autopct='%1.1f%%', startangle=140)
+        ax.axis('equal')
+        fig.savefig(path, bbox_inches='tight')
+        plt.close(fig)
+    elif HAS_PLOTLY and HAS_KALEIDO:
+        fig = px.pie(values=counts, names=labels, title='Status Distribution')
+        fig.write_image(path)
+    else:
+        
+        return None
+    return path
+
+
+def render_severity_bar(severity_json):
+    if not severity_json or not severity_json.get("data"):
+        return None
+    labels = [str(it.get("label", "")) for it in severity_json["data"]]
+    counts = [int(it.get("count", 0)) for it in severity_json["data"]]
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    path = tmp.name
+    tmp.close()
+
+    if HAS_MPL:
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.bar(labels, counts)
+        ax.set_xlabel('Severity')
+        ax.set_ylabel('Count')
+        ax.set_title('Severity Distribution')
+        fig.savefig(path, bbox_inches='tight')
+        plt.close(fig)
+    elif HAS_PLOTLY and HAS_KALEIDO:
+        fig = px.bar(x=labels, y=counts, labels={'x':'Severity','y':'Count'}, title='Severity Distribution')
+        fig.write_image(path)
+    else:
+        
+        return None
+    return path
+
+def create_pdf(text, status_json=None, severity_json=None, chart_paths=[]):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_font("Arial", size=11)
+
+    for line in text.split("\n"):
+        pdf.multi_cell(0, 8, line)
+
+    
+    pdf.ln(4)
+
+    
+    if status_json and isinstance(status_json.get("data"), list) and status_json["data"]:
+        pdf.set_font("Arial", 'B', 11)
+        pdf.cell(0, 8, "Status Summary:", ln=True)
+        pdf.set_font("Arial", size=10)
+        
+        pdf.cell(120, 8, "Status", border=1)
+        pdf.cell(40, 8, "Count", border=1, ln=True)
+        for it in status_json["data"]:
+            pdf.cell(120, 8, str(it.get("label", "")), border=1)
+            pdf.cell(40, 8, str(it.get("count", "")), border=1, ln=True)
+        pdf.ln(4)
+
+    
+    if severity_json and isinstance(severity_json.get("data"), list) and severity_json["data"]:
+        pdf.set_font("Arial", 'B', 11)
+        pdf.cell(0, 8, "Severity Summary:", ln=True)
+        pdf.set_font("Arial", size=10)
+        pdf.cell(120, 8, "Severity", border=1)
+        pdf.cell(40, 8, "Count", border=1, ln=True)
+        for it in severity_json["data"]:
+            pdf.cell(120, 8, str(it.get("label", "")), border=1)
+            pdf.cell(40, 8, str(it.get("count", "")), border=1, ln=True)
+        pdf.ln(4)
+
+    
+    for p in chart_paths:
+        try:
+            pdf.image(p, w=170)
+            pdf.ln(4)
+        except Exception:
+            continue
+
+    path = "incident_report.pdf"
+    pdf.output(path)
+    return path
+
+def create_docx(text, status_json=None, severity_json=None, chart_paths=[]):
+    if not HAS_DOCX:
+        raise ImportError("python-docx not installed")
+    doc = Document()
+
+    
+    for line in text.split("\n"):
+        if line.strip() == "":
+            doc.add_paragraph()
+        else:
+            doc.add_paragraph(line)
+
+    
+    if status_json and isinstance(status_json.get("data"), list) and status_json["data"]:
+        doc.add_heading('Status Summary', level=3)
+        tbl = doc.add_table(rows=1, cols=2)
+        hdr_cells = tbl.rows[0].cells
+        hdr_cells[0].text = 'Status'
+        hdr_cells[1].text = 'Count'
+        for it in status_json["data"]:
+            row_cells = tbl.add_row().cells
+            row_cells[0].text = str(it.get('label', ''))
+            row_cells[1].text = str(it.get('count', ''))
+
+    
+    if severity_json and isinstance(severity_json.get("data"), list) and severity_json["data"]:
+        doc.add_heading('Severity Summary', level=3)
+        tbl = doc.add_table(rows=1, cols=2)
+        hdr_cells = tbl.rows[0].cells
+        hdr_cells[0].text = 'Severity'
+        hdr_cells[1].text = 'Count'
+        for it in severity_json["data"]:
+            row_cells = tbl.add_row().cells
+            row_cells[0].text = str(it.get('label', ''))
+            row_cells[1].text = str(it.get('count', ''))
+
+    
+    for p in chart_paths:
+        try:
+            doc.add_picture(p, width=Inches(6))
+        except Exception:
+            continue
+
+    path = "incident_report.docx"
+    doc.save(path)
+    return path
+
+
+st.set_page_config(page_title="AI-Driven Incident Report Generator", layout="wide")
+
+st.title("🛠️ AI-Driven Incident Report Generator for IT Performance Issues")
+
+st.markdown("Upload an Excel or CSV file with incident data. The app will generate a structured report and graphs based on the actual fields present.")
+
+uploaded_file = st.file_uploader("Upload Incident Data (Excel/JSON/CSV)", type=["xlsx", "json", "csv"])
+
+df = None
+
+if uploaded_file:
+    file_type = uploaded_file.name.split('.')[-1]
+    if file_type == "xlsx":
+        df = pd.read_excel(uploaded_file)
+    elif file_type == "json":
+        data = json.load(uploaded_file)
+        if isinstance(data, dict):
+            df = pd.DataFrame([data])
+        elif isinstance(data, list) and len(data) > 0:
+            df = pd.DataFrame(data)
+    elif file_type == "csv":
+        df = pd.read_csv(uploaded_file)
+
+    if df is not None:
+        
+        clean_cols = [str(c).strip().replace('_', ' ').title() for c in df.columns]
+        df_display = df.copy()
+        df_display.columns = clean_cols
+
+        
+        st.write("### Data Table:")
+        st.dataframe(df_display)
+        
+        
+        df_for_llm = df.copy()
+
+        if st.button("Generate LLM Insights Report"):
+            
+            csv_data = df.to_csv(index=False)
+            llm_prompt = f"""
+You are an expert ITSM analyst. Analyze the following incident data (in CSV format) and generate a concise summary report with actionable insights. Do not repeat the raw data. Additionally, produce prompt-driven chart data as requested.
+
+Incident Data (CSV):
+{csv_data}
+"""
+            try:
+                report = generate_report(llm_prompt)
+                if not report or not report.strip():
+                    st.error("LLM did not return a report. Please check your API key, endpoint, or try with a smaller file.")
+                else:
+                    st.subheader("LLM Insights Incident Report")
+                    
+                    narrative = _strip_json_blocks(report)
+                    
+                    st.text_area("", value=narrative, height=400)
+
+                    
+                    status_json = _extract_tag_json(report, "STATUS_PIE")
+                    severity_json = _extract_tag_json(report, "SEVERITY_BAR")
+
+                    
+                    status_json = _extract_tag_json(report, "STATUS_PIE")
+                    severity_json = _extract_tag_json(report, "SEVERITY_BAR")
+
+                    
+                    if status_json and isinstance(status_json.get("data"), list) and status_json["data"]:
+                        labels = [str(it.get("label", "")) for it in status_json["data"]]
+                        counts = [float(it.get("count", 0)) for it in status_json["data"]]
+                        st.write("##### Status (Pie Chart)")
+                        try:
+                            if HAS_PLOTLY:
+                                fig = px.pie(values=counts, names=labels, title='Status Distribution')
+                                st.plotly_chart(fig, use_container_width=True)
+                            elif HAS_MPL:
+                                fig, ax = plt.subplots(figsize=(6,4))
+                                ax.pie(counts, labels=labels, autopct='%1.1f%%', startangle=140)
+                                ax.axis('equal')
+                                st.pyplot(fig)
+                            else:
+                                st.dataframe(pd.DataFrame({"Status": labels, "Count": counts}))
+                        except Exception as e:
+                            st.warning(f"Could not render status pie chart: {e}")
+                    else:
+                        st.info("No LLM-provided status pie data detected.")
+
+                    if severity_json and isinstance(severity_json.get("data"), list) and severity_json["data"]:
+                        labels = [str(it.get("label", "")) for it in severity_json["data"]]
+                        counts = [int(it.get("count", 0)) for it in severity_json["data"]]
+                        st.write("##### Severity (Bar Chart)")
+                        try:
+                            st.bar_chart(pd.Series(counts, index=labels))
+                        except Exception as e:
+                            st.warning(f"Could not render severity bar chart: {e}")
+                    else:
+                        st.info("No LLM-provided severity bar data detected.")
+
+                    
+                    narrative = _strip_json_blocks(report)
+
+                    
+                    chart_files = []
+                    pie_path = render_status_pie(status_json)
+                    if pie_path:
+                        chart_files.append(pie_path)
+                    bar_path = render_severity_bar(severity_json)
+                    if bar_path:
+                        chart_files.append(bar_path)
+
+                    
+                    pdf_path = create_pdf(narrative, status_json=status_json, severity_json=severity_json, chart_paths=chart_files)
+                    with open(pdf_path, "rb") as f:
+                        st.download_button("⬇️ Download as PDF", data=f, file_name="llm_insights_incident_report.pdf")
+
+                    
+                    if HAS_DOCX:
+                        try:
+                            docx_path = create_docx(narrative, status_json=status_json, severity_json=severity_json, chart_paths=chart_files)
+                            with open(docx_path, "rb") as f:
+                                st.download_button("⬇️ Download as Word (.docx)", data=f, file_name="llm_insights_incident_report.docx")
+                        except Exception as e:
+                            st.warning(f"Could not generate Word file: {e}")
+                    else:
+                        st.info("To download an editable Word file, install python-docx: pip install python-docx")
+
+            except Exception as e:
+                st.error(f"Error from LLM: {e}")
+else:
+    st.info("Upload a file to begin. The app will show the data table in the UI but downloads (PDF/DOCX) will contain the narrative, split column summaries for status/severity and embedded charts, not the raw incident table or JSON blocks.")
