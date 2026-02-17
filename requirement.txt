@@ -1,0 +1,9 @@
+streamlit
+langchain
+faiss-cpu
+sentence-transformers
+pypdf
+openai
+python-dotenv
+faster-whisper
+pyttsx3
